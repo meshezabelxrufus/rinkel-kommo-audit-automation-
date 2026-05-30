@@ -1,0 +1,53 @@
+
+services:
+  # ── API Server ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rinkel-api
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+    volumes:
+      - ./app:/app/app:ro           # live reload in dev (read-only mount)
+      - export-data:/data/exports
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    command: >
+      python -m uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --log-level debug
+
+  # ── PostgreSQL (local dev — mirrors Supabase schema) ─────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: rinkel-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: rinkel
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+    driver: local
+  export-data:
+    driver: local

@@ -1,0 +1,184 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# docker-compose.prod.yml — Production stack
+#
+# Services:
+#   api      - FastAPI application (2+ uvicorn workers)
+#   nginx    - Reverse proxy + SSL termination + rate limiting
+#   postgres - Local PostgreSQL (optional — use Supabase in production)
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f api
+#   docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: rinkel-prod
+
+services:
+
+  # ── FastAPI Application ────────────────────────────────────────────────────
+  api:
+    image: rinkel-auditor:${APP_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: rinkel-api
+    restart: always
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      LOG_LEVEL: info
+      WORKERS: ${WORKERS:-2}
+      PORT: 8000
+      # Override temp dir to named volume path
+      AUDIO_TEMP_DIR: /data/audio-temp
+      EXPORT_DIR: /data/exports
+      GOOGLE_SERVICE_ACCOUNT_FILE: /data/credentials/service-account.json
+    volumes:
+      # Persistent export files
+      - export-data:/data/exports
+      # Ephemeral audio temp (tmpfs for speed + security)
+      - audio-temp:/data/audio-temp
+      # Google service account (mounted read-only from host)
+      - ${CREDENTIALS_DIR:-./credentials}:/data/credentials:ro
+      # Structured logs
+      - log-data:/data/logs
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # Resource limits — tune to your VPS size
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service=api"
+    networks:
+      - internal
+      - proxy
+
+  # ── Nginx Reverse Proxy ────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: rinkel-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
+      # SSL certificates (managed by Certbot on host)
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
+      # Nginx logs
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - proxy
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  # OPTIONAL: Skip if using Supabase cloud.
+  # Set DATABASE_URL in .env.prod to point to Supabase instead.
+  postgres:
+    image: postgres:16-alpine
+    container_name: rinkel-db
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rinkel}
+      POSTGRES_USER: ${POSTGRES_USER:-rinkel_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./supabase/migrations:/docker-entrypoint-initdb.d:ro
+    # Do NOT expose port 5432 externally in production
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rinkel_user} -d ${POSTGRES_DB:-rinkel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - internal
+
+# ── Networks ───────────────────────────────────────────────────────────────
+networks:
+  # Internal: api ↔ postgres (not accessible from host)
+  internal:
+    driver: bridge
+    internal: true
+  # Proxy: nginx ↔ api (nginx faces the internet)
+  proxy:
+    driver: bridge
+
+# ── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  pg-data:
+    driver: local
+  export-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${EXPORT_HOST_DIR:-/var/rinkel/exports}
+  audio-temp:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=2g,mode=1777"
+  log-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${LOG_HOST_DIR:-/var/log/rinkel}
+  nginx-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${NGINX_LOG_DIR:-/var/log/nginx/rinkel}
