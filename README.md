@@ -191,3 +191,166 @@ All settings via environment variables. See [`.env.example`](.env.example) for d
 - **No secrets in image**: All credentials via env vars or volume-mounted files
 - **Batched DB reads**: Export engine fetches in configurable batch sizes (default 100)
 - **tmpfs for audio**: Ephemeral audio temp files stored in RAM-backed tmpfs
+
+---
+
+## Kommo CRM Audit Layer
+
+A fully self-contained, read-only analytics layer that combines **Kommo CRM leads** with **Rinkel call records** to answer the question:
+
+> **"How is each agent performing across CRM + calls?"**
+
+No database. No API calls. No ingestion layer. Pure computation from local JSON exports.
+
+### Data Flow
+
+```
+exports/
+  leads.json          ← Kommo API export (448 leads)
+  pipelines.json      ← 11 pipelines, 110 stages
+  chats.json          ← 321 WhatsApp conversations
+  messages_flat.json  ← 154 AI-ready messages
+        │
+        ▼
+  KommoProvider           reads & caches JSON exports (envelope-aware)
+        │
+        ├──▶ LeadNormalizer        raw leads → NormalizedLead (str|None fields)
+        │
+        ├──▶ AgentLinkingEngine    Kommo + Rinkel → AgentUnifiedProfile per agent
+        │
+        ├──▶ MetricsCalculator     conversion rate, engagement score, call coverage
+        │
+        ├──▶ KommoAuditService     unified high-level service (lazy-cached)
+        │
+        ├──▶ KommoExportService    JSONL exporter → Claude audit pipeline
+        │
+        └──▶ AuditEngine           7-step pipeline → AgentAuditReport list
+```
+
+### Kommo Layer Services
+
+| Service | File | Purpose |
+|---------|------|---------|
+| `KommoProvider` | `app/integrations/kommo.py` | Read-only JSON export reader with caching and lookup helpers |
+| `LeadNormalizer` | `app/services/lead_normalizer.py` | Converts raw leads → stable `NormalizedLead` (all str\|None) |
+| `AgentLinkingEngine` | `app/services/agent_linking_engine.py` | Joins Kommo + Rinkel by `responsible_user_id` |
+| `KommoAuditService` | `app/services/kommo_audit_service.py` | Unified high-level API (lazy-cached) |
+| `MetricsCalculator` | `app/services/metrics_calculator.py` | Per-agent performance metrics |
+| `KommoExportService` | `app/services/kommo_export_service.py` | JSONL exporter with SHA-256 checksum |
+| `AuditEngine` | `app/services/audit_engine.py` | Full 7-step pipeline → `AgentAuditReport` |
+
+### AuditEngine — Quick Start
+
+```python
+from app.services.audit_engine import AuditEngine
+
+# Kommo-only (no Rinkel calls)
+engine = AuditEngine(exports_dir="exports/")
+reports = engine.run()
+
+for report in reports:
+    print(
+        report.agent_id,
+        f"leads={report.kommo.total_leads}",
+        f"conversion={report.kommo.conversion_rate:.0%}",
+        f"score={report.combined.performance_score:.4f}",
+    )
+
+# With Rinkel calls + explicit agent ID cross-reference
+engine = AuditEngine(
+    exports_dir="exports/",
+    rinkel_calls=rinkel_call_list,
+    agent_id_map={"agent-nl-007": "10359915"},
+)
+reports = engine.run()                    # sorted by performance_score desc
+
+# Single agent
+report = engine.run_for_agent("10359915")
+
+# Summary table
+summary = engine.summary()
+# {
+#   "total_agents": 2,  "total_leads": 448,
+#   "avg_performance_score": 0.43,
+#   "top_performer": "10359915",
+#   ...
+# }
+
+# JSONL export
+from app.services.kommo_export_service import KommoExportService
+exporter = KommoExportService(exports_dir="exports/", output_dir="exports/jsonl/")
+result = exporter.export()
+# {"file_path": "...", "records_written": 2, "checksum": "...", ...}
+```
+
+### AgentAuditReport Structure
+
+```python
+AgentAuditReport(
+    agent_id = "10359915",
+
+    kommo = KommoSection(
+        total_leads      = 299,
+        converted_leads  = 1,
+        lost_leads       = 77,
+        active_leads     = 221,
+        conversion_rate  = 0.0033,   # 0.0–1.0
+    ),
+
+    rinkel = RinkelSection(
+        total_calls       = 0,       # populated when rinkel_calls injected
+        avg_call_duration = 0.0,
+        inbound_calls     = 0,
+        outbound_calls    = 0,
+        engagement_score  = 0.1,    # 0.0–1.0
+    ),
+
+    combined = CombinedSection(
+        performance_score    = 0.1513,  # 0.0–1.0 (primary KPI)
+        activity_consistency = 0.5,
+        leads_to_calls_ratio = 0.0,
+        responsiveness_proxy = 0.0,
+        data_source_flags    = {"kommo": True, "rinkel": False},
+    ),
+)
+```
+
+### Performance Score Formula
+
+```
+performance_score = 0.40 × conversion_rate       (CRM quality)
+                  + 0.35 × engagement_score       (call activity vs leads)
+                  + 0.25 × activity_consistency   (present in both systems)
+```
+
+### Lead Classification Logic
+
+| Signal | Classification |
+|--------|---------------|
+| `loss_reason_id IS NOT NULL` | **Lost** (highest priority) |
+| `closed_at IS NOT NULL AND loss_reason_id IS NULL` | **Won** |
+| Non-editable stage with "ganado/won/opgelost" keyword | **Won** |
+| Non-editable stage with "perdido/lost/cancelada" keyword | **Lost** |
+| Everything else | **Active** |
+
+### Kommo Layer Test Coverage
+
+```
+tests/test_kommo_provider.py         64 tests  ← KommoProvider
+tests/test_lead_normalizer.py        68 tests  ← LeadNormalizer
+tests/test_agent_linking_engine.py   59 tests  ← AgentLinkingEngine
+tests/test_kommo_audit_service.py    81 tests  ← KommoAuditService
+tests/test_metrics_calculator.py     82 tests  ← MetricsCalculator
+tests/test_kommo_export_service.py   73 tests  ← KommoExportService
+tests/test_audit_engine.py           82 tests  ← AuditEngine
+────────────────────────────────────────────────────────────────
+Total Kommo layer:                  509 tests  — all passing
+```
+
+### Running All Tests
+
+```bash
+source venv/bin/activate
+python -m pytest tests/ -q
+# 509 passed in ~1s
+```
