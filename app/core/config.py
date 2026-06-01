@@ -75,6 +75,16 @@ class Settings(BaseSettings):
     export_max_records: int = 50000       # safety cap per export job
     export_retention_days: int = 30       # auto-cleanup after N days
 
+    # ── Claude / Anthropic ────────────────────────────────────────────────
+    # Used by ClaudeAuditExecutor. If empty, the SDK reads ANTHROPIC_API_KEY
+    # from the environment automatically.
+    anthropic_api_key: str = ""
+
+    # ── Kommo CRM Audit Layer ─────────────────────────────────────────────
+    # Path to the directory containing Kommo JSON exports.
+    # Passed to KommoProvider / AuditEngine as exports_dir.
+    kommo_exports_dir: str = "./exports"
+
     @property
     def cors_origins_list(self) -> list[str]:
         """Parse comma-separated CORS origins into a list."""
